@@ -4,9 +4,10 @@ import 'dart:developer';
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
-import 'package:mercure_client/src/mercure.dart';
-import 'package:mercure_client/src/mercure_error.dart';
-import 'package:mercure_client/src/mercure_event.dart';
+
+import 'mercure.dart';
+import 'mercure_error.dart';
+import 'mercure_event.dart';
 
 /// {@template mercure_client.mercure_client}
 /// A class that allows subscibe and publish to Mercure hub.
@@ -57,7 +58,7 @@ class MercureClient extends RetryStream<MercureEvent> implements Mercure {
         throw MercureException.contentType(response);
       }
 
-      yield* response.stream.transform<MercureEvent>(_streamTransformer());
+      yield* response.stream.transform<MercureEvent>(_chunkedStreamTransformer());
     } on HandshakeException catch (_) {
       log('Mercure: Handshake failed at ${DateTime.now()}');
       throw MercureException.eventSource(url);
@@ -73,22 +74,47 @@ class MercureClient extends RetryStream<MercureEvent> implements Mercure {
     }
   }
 
-  StreamTransformer<List<int>, MercureEvent> _streamTransformer() {
+  StreamTransformer<List<int>, MercureEvent> _chunkedStreamTransformer() {
+    final buffer = StringBuffer();
+
     return StreamTransformer.fromHandlers(
       handleData: (data, sink) {
-        final raw = utf8.decode(data, allowMalformed: true).trim();
+        final rawChunk = utf8.decode(data, allowMalformed: true);
+        buffer.write(rawChunk);
 
-        if (raw.isEmpty || raw.startsWith(':')) {
-          return;
+        final events = buffer.toString().split('\n\n');
+
+        for (var i = 0; i < events.length - 1; i++) {
+          final rawEvent = events[i].trim();
+          if (rawEvent.isEmpty || rawEvent.startsWith(':')) {
+            continue;
+          }
+          try {
+            final event = MercureEvent.raw(rawEvent);
+            lastEventId = event.id;
+            sink.add(event);
+          } catch (error) {
+            sink.addError(error);
+          }
         }
 
-        try {
-          final event = MercureEvent.raw(raw);
-          lastEventId = event.id;
-          sink.add(event);
-        } catch (error) {
-          sink.addError(error);
+        // Keep the last incomplete part in the buffer
+        buffer
+          ..clear()
+          ..write(events.last);
+      },
+      handleDone: (sink) {
+        final remaining = buffer.toString().trim();
+        if (remaining.isNotEmpty && !remaining.startsWith(':')) {
+          try {
+            final event = MercureEvent.raw(remaining);
+            lastEventId = event.id;
+            sink.add(event);
+          } catch (error) {
+            sink.addError(error);
+          }
         }
+        sink.close();
       },
     );
   }
@@ -100,11 +126,11 @@ class MercureClient extends RetryStream<MercureEvent> implements Mercure {
 class MercureRequest extends http.Request {
   /// {@macro mercure_client.mercurerequest}
   MercureRequest(
-    String hub,
-    List<String> topics, {
-    this.authorization,
-    this.lastEventId,
-  }) : super('GET', build(hub, topics));
+      String hub,
+      List<String> topics, {
+        this.authorization,
+        this.lastEventId,
+      }) : super('GET', build(hub, topics));
 
   /// Format request uri
   static Uri build(String hub, List<String> topics) {
@@ -162,11 +188,11 @@ abstract class RetryStream<T> extends Stream<T> {
 
   @override
   StreamSubscription<T> listen(
-    void Function(T event)? onData, {
-    Function? onError,
-    void Function()? onDone,
-    bool? cancelOnError,
-  }) {
+      void Function(T event)? onData, {
+        Function? onError,
+        void Function()? onDone,
+        bool? cancelOnError,
+      }) {
     return _controller.stream.listen(
       onData,
       onError: onError,
